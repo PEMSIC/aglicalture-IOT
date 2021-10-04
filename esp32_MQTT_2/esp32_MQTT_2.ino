@@ -5,9 +5,9 @@
 
 //#include:外部のあらかじめ用意された機能群(ライブラリ)を取り入れる
 #include <WiFi.h>         
-#include <PubSubClient.h>
+#include <PubSubClient.h>  //MQTT通信のために必要
 #include <Wire.h>
-#include <Adafruit_BME280.h>
+#include <Adafruit_BME280.h>   //BME280なのでいらない
 #include <Adafruit_Sensor.h>
 
 //const char*:定数のデータへのポインタで、中身の変更は不可能だが、アドレスは変更可
@@ -30,13 +30,13 @@ int value = 0;        //wsp-wroom-02では4バイト、ArduinoUno等では2バ�
 #define BME_MOSI 23
 #define BME_CS 5*/
 
-Adafruit_BME280 bme; // I2C
+Adafruit_BME280 bme; // I2C  BME280を使用しないので、ここは変更する
 //Adafruit_BME280 bme(BME_CS); // hardware SPI
 //Adafruit_BME280 bme(BME_CS, BME_MOSI, BME_MISO, BME_SCK); // software SPI
 float temperature = 0;      //float:小数を扱える  温度
 float humidity = 0;         //湿度
 
-// LED Pin
+// LED Pin　LEDはいらない
 const int ledPin = 4;     //const:変数として扱うが、値が変更できない(計算には使えるが、途中で違う値を入れ込むことはできない)  LED用のピンを定義
 
 
@@ -46,15 +46,15 @@ void setup() {
   // default settings
   // (you can also pass in a Wire library object like &Wire2)
   //status = bme.begin();  
-  if (!bme.begin(0x76)) {   //?
+  if (!bme.begin(0x76)) {   //BME280に関係するので、これもいらない　DS18B20版はいる?
     Serial.println("Could not find a valid BME280 sensor, check wiring!");    //「有効なBME280センサーが見つからない、配線をチェックしてください」と送信
     while (1);    //無限ループ
   }
-  setup_wifi();   //関数(WiFi接続)
+  setup_wifi();   //関数(WiFi接続)　これはいる？
   client.setServer(mqtt_server, 1883);    //インスタンス化(実体化)したオブジェクトclientの接続先のサーバを、アドレスとポート番号を設定して通信できるようにする
   client.setCallback(callback);   //callback関数の設定
 
-  pinMode(ledPin, OUTPUT);    //LEDピンの動作を出力に設定
+  pinMode(ledPin, OUTPUT);    //LEDピンの動作を出力に設定　LEDなのでいらない
 }
 
 //setupで使用する関数
@@ -81,6 +81,7 @@ void setup_wifi() {   //WiFiに接続するための関数
 //IPアドレス：データの送信元や送信先などを識別するのに使用されている番号
 
 /*ブローカーからのメッセージを受信すると呼び出される関数
+ *受信データの処理を行う
  * topic:デバイス間の通信データの識別を行うための階層構造を識別するデータ
  * message:ブローカーから送られたメッセージ・データ
  * length:メッセージ長
@@ -92,7 +93,7 @@ void callback(char* topic, byte* message, unsigned int length) {
   Serial.print(". Message: ");    //「. Message: 」と表示
   String messageTemp;   //文字列？
   
-  for (int i = 0; i < length; i++) {
+  for (int i = 0; i < length; i++) {  //メッセージ長だけ繰り返す
     Serial.print((char)message[i]);
     messageTemp += (char)message[i];
   }
@@ -102,15 +103,15 @@ void callback(char* topic, byte* message, unsigned int length) {
 
   // If a message is received on the topic esp32/output, you check if the message is either "on" or "off". 
   // Changes the output state according to the message
-  if (String(topic) == "esp32/output") {
+  if (String(topic) == "esp32/output") {  //String()：Stringクラス(文字列)のインスタンスを生成？
     Serial.print("Changing output to ");
     if(messageTemp == "on"){
       Serial.println("on");
-      digitalWrite(ledPin, HIGH);
+      digitalWrite(ledPin, HIGH);  //LED点灯
     }
     else if(messageTemp == "off"){
       Serial.println("off");
-      digitalWrite(ledPin, LOW);
+      digitalWrite(ledPin, LOW);  //LED消灯
     }
   }
 }
@@ -137,13 +138,13 @@ void reconnect() {
 
 //実行したいメインのプログラム(繰り返し実行される)
 void loop() {
-  if (!client.connected()) {
+  if (!client.connected()) {  //接続できていない場合
     reconnect();    //関数(再接続)
   }
   client.loop();
 
   long now = millis();    //long:32ビットの数値を格納できる
-  if (now - lastMsg > 5000) {
+  if (now - lastMsg > 5000) {   //5秒間隔でループ
     lastMsg = now;
     
     // Temperature in Celsius
@@ -152,16 +153,19 @@ void loop() {
     // (and comment the previous temperature line)
     //temperature = 1.8 * bme.readTemperature() + 32; // Temperature in Fahrenheit    この行のコメントを有効化すると、摂氏ではなく華氏で表示できる
     
-    // Convert the value to a char array
+    // Convert the value to a char array  値をchar配列に変換します
     char tempString[8];           //char:符号(+や-)付きの1バイトの数値を記憶する
-    dtostrf(temperature, 1, 2, tempString);
+    dtostrf(temperature, 1, 2, tempString);  
+    /*dtostrf関数は小数点を含む数値を文字列に変換
+    数値temperatureを文字列(全1文字の小数点以下2文字)に変換してtempStringに代入
+    合計1桁なのに小数点以下が2文字？*/
     Serial.print("Temperature: ");
     Serial.println(tempString);
     client.publish("esp32/temperature", tempString);
 
     humidity = bme.readHumidity();
     
-    // Convert the value to a char array
+    // Convert the value to a char array  値をchar配列に変換します
     char humString[8];            //char:符号(+や-)付きの1バイトの数値を記憶する
     dtostrf(humidity, 1, 2, humString);
     Serial.print("Humidity: ");
