@@ -25,7 +25,7 @@ def main():
   client.on_publish = on_publish         # メッセージ送信時のコールバック
 
   # adress = "mms.mist-hospital.mydns.jp"
-  adress = "133.45.129.190"
+  adress = "133.45.129.18"
 
   client.connect(adress, 11883, 60)  # 接続先は自分自身
   print("0")
@@ -34,7 +34,7 @@ def main():
   print("1")
   # 永久に繰り返す
   # while True:
-  client.publish("test/one",'{"id":2, "user_name": "testss", "message":"tessting"}')    # トピック名とメッセージを決めて送信
+  client.publish("agriIoT/message",'{"id":2, "user_name": "testssss", "node_name": "testssss", "message":"tessting"}')    # トピック名とメッセージを決めて送信
   print("2")
   sleep(3)   # 3秒待つ
 
