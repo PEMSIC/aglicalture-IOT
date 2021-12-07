@@ -1,0 +1,15 @@
+[Unit]
+Description=Raingauge
+After=syslog.target network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python pulse_count.py
+WorkingDirectory=/opt/kabayaki/raingauge
+KillMode=process
+Restart=always
+User=pi
+Group=pi
+
+[Install]
+WantedBy=multi-user.target
