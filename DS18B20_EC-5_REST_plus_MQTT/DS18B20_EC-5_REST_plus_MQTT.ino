@@ -1,4 +1,3 @@
-
 //210416 Firebeetole+DS180B20+deepsleep(Wifi off) for Isahaya
 
 // Grab a count of devices on the wire
@@ -32,9 +31,11 @@ uint8_t numberOfDevices = 8;
 #include "soc/syscon_reg.h"
 #include <PubSubClient.h>  //MQTT通信のために必要
 
-const char MY_SSID[] = "PIX-MT100";
-const char MY_PASSWORD[] = "mistmist";
-const char* mqtt_server = "133.45.129.190"; //MQTTのIPアドレス　追加
+const char MY_SSID[] = "PIX-MT100"; //E213
+const char MY_PASSWORD[] = "mistmist";  //213wl213wl
+const char* MQTT_Server = "133.45.129.18"; //MQTTのIPアドレスまたはホスト名　追加  133.45.129.190  mms.mist-hospital.mydns.jp
+const uint16_t MQTT_Port = 11883; //MQTTブローカのポート番号(TCP接続)
+
 WiFiClient espClient;           //client.connect()で定義されている指定のインターネットIPアドレスおよびポートに接続できるクライアントを作成?
 PubSubClient client(espClient);     //MQTTの通信を行うためのPubsubClientのクラスから実際に処理を行うオブジェクトclientを作成?
 
@@ -54,7 +55,7 @@ uint8_t baseMac[6];
 #define ONE_WIRE_BUS 4
 
 //Field ID
-#define FIELDID 1005 // 諫早干拓"Isahaya1"のフィールド番号
+#define FIELDID 1007 // テストサーバー"test2"のフィールド番号
 
 //Initial Condition Test Term 5 min wake 210324
 #define BOOTCOUNT_CONST 80
@@ -80,7 +81,7 @@ void post_PSVolServer();                        // Power Supply Voltageをサー
 void post_wifilevel();                          // ESP32のRSSIをサーバーに送信
 void post_EC5data();                            // EC-5のアナログ電圧をサーバーに送信
 void callback(char* topic, byte* message, unsigned int length);                                // 使うか不明　デバッグ用？　追加
-void reconnect();                               // 再接続のための関数
+void MQTT_reconnect();                               // 再接続のための関数
 
 RTC_DATA_ATTR int bootCount = 0;
 
@@ -97,7 +98,7 @@ uint16_t boot_time_span = 5;
 uint16_t time_span = 30;
 
 //ADC chnnel
-const int adcPin[5] = {36, 39, 34, 35, 15};
+const int adcPin[4] = {36, 39, 34, 35};
 
 const int R1 = 27000;
 const int R2 = 27000;
@@ -109,23 +110,23 @@ void setup()
 {
   esp_startup(); 
   delay(100);
+
   wifi_startup();
 
-  client.setServer(mqtt_server, 1883);    //インスタンス化(実体化)したオブジェクトclientの接続先のサーバを、アドレスとポート番号を設定して通信できるようにする　追加
+  client.setServer(MQTT_Server, MQTT_Port);    //インスタンス化(実体化)したオブジェクトclientの接続先のサーバを、アドレスとポート番号を設定して通信できるようにする　追加
   client.setCallback(callback);   //callback関数の設定　追加
 
   if (!client.connected()) {  //接続できていない場合
-    reconnect();    //関数(再接続)
+    MQTT_reconnect();    //関数(再接続)
   }
   client.loop();
 
   esp_read_mac(baseMac, ESP_MAC_WIFI_STA);
   activate_sensors();
   delay(1000);
+
   configTime(0, 0, "ntp.nict.jp", "time.google.com", "ntp.jst.mfeed.ad.jp");
-
   DS18B20_startup();
-
   post_DS18B20data();
   post_PSVolServer(); // Power Supply Voltage Monitoring
   post_wifilevel();
@@ -260,8 +261,6 @@ void post_DS18B20data()
     if (sensors.getAddress(tempDeviceAddress, i))
     {
       // Output the device ID
-
-
       Serial.print(" Temperature for device: ");
       Serial.println(i, DEC);
       // Print the data
@@ -276,7 +275,7 @@ void post_DS18B20data()
     // Block until we are able to connect to the WiFi access point
     HTTPClient http;
     http.begin("http://mist-hospital.mydns.jp/kabayaki/db/DS18B20");
-    http.addHeader("Content-Type", "application/json");
+    http.addHeader("Content-Type", "application/json"); 
 
     StaticJsonDocument<200> doc;
     // Add values in the document
@@ -290,22 +289,29 @@ void post_DS18B20data()
 
     String requestBody;
     serializeJson(doc, requestBody);
-
+ 
     int httpResponseCode = http.POST(requestBody);
 
-    if (httpResponseCode > 0)
-    {
+    if (httpResponseCode > 0)    {
       String response = http.getString();
       Serial.println(httpResponseCode);
       Serial.println(response);
-    }
-
-    else
-    {
+    }else{
       //Serial.printf("Error occurred while sending HTTP POST: %s\n", HTTPClient.errorToString(statusCode).c_str());
     }
+ 
+    //Serial.println(requestBody);
 
+    const char* requestChar = requestBody.c_str(); //MQTTでpublishするためにはJSONドキュメントをstring型からconst char*型にする必要があるため
+
+    if (client.publish("shirasuCorp/demo/DS18B20", requestChar) == true) {
+    Serial.println("Success sending message");
+    } else {
+    Serial.println("Error sending message");
+    }
+    client.loop();
     delay(100);
+    
   }
 }
 
@@ -320,9 +326,19 @@ void printAddress(DeviceAddress deviceAddress)
   }
 }
 
+
 void post_PSVolServer()
 {
-  float voltage = analogReadMilliVolts(adcPin[0]) * (R1 + R2) / R2 / 1000.0; //電池電圧を分圧してる計算っぽい
+  uint32_t sum = 0;
+  for (int i = 0; i < NUM_OF_SAMP; i++)
+  {
+    one_shot_voltage[i] = analogReadMilliVolts(adcPin[0]);
+  }
+  for (int i = 0; i < NUM_OF_SAMP; i++)
+  {
+    sum += one_shot_voltage[i];
+  }
+  float voltage = sum / NUM_OF_SAMP * (R1 + R2) / R2 / 1000.0; //電池電圧を分圧してる計算っぽい
 
   char baseMacChr[18] = {0};
   sprintf(baseMacChr, "%02X:%02X:%02X:%02X:%02X:%02X", baseMac[0], baseMac[1], baseMac[2], baseMac[3], baseMac[4], baseMac[5]);
@@ -348,17 +364,26 @@ void post_PSVolServer()
 
   String requestBody;
   serializeJson(doc, requestBody);
+  
+  //Serial.println(requestBody);
+ 
+  /*const char* requestChar = requestBody.c_str();
 
+    if (client.publish("shirasuCorp/demo/PSVol", JSONmessageBuffer) == true) {
+    Serial.println("Success sending message");
+  } else {
+    Serial.println("Error sending message");
+  }
+ 
+  client.loop();*/
+  
   int httpResponseCode = http.POST(requestBody);
 
-  if (httpResponseCode > 0)
-  {
+  if (httpResponseCode > 0)  {
     String response = http.getString();
     Serial.println(httpResponseCode);
     Serial.println(response);
-  }
-  else
-  {
+  }  else  {
     //      Serial.printf("Error occurred while sending HTTP POST: %s\n", HTTPClient.errorToString(statusCode).c_str());
   }
 
@@ -366,7 +391,9 @@ void post_PSVolServer()
   Serial.println(baseMacChr);
   Serial.println("PSVol:");
   Serial.println(voltage);
+  
 }
+  
 
 void post_wifilevel()
 {
@@ -398,22 +425,33 @@ void post_wifilevel()
 
   int httpResponseCode = http.POST(requestBody);
 
-  if (httpResponseCode > 0)
-  {
+  if (httpResponseCode > 0)  {
     String response = http.getString();
     Serial.println(httpResponseCode);
     Serial.println(response);
-  }
-  else
-  {
+  }  else  {
     //      Serial.printf("Error occurred while sending HTTP POST: %s\n", HTTPClient.errorToString(statusCode).c_str());
   }
+
+  //Serial.println(requestBody);
+ 
+  /*const char* requestChar = requestBody.c_str();
+
+  if (client.publish("shirasuCorp/demo/wifilevel", requestChar) == true) {
+  Serial.println("Success sending message");
+  } else {
+  Serial.println("Error sending message");
+  }
+ 
+  client.loop();*/
 
   Serial.println("MAC:");
   Serial.println(baseMacChr);
   Serial.println("RSSi:");
   Serial.println(rssi);
+ 
 }
+
 
 void post_EC5data()
 {
@@ -465,11 +503,26 @@ void post_EC5data()
     //      Serial.printf("Error occurred while sending HTTP POST: %s\n", HTTPClient.errorToString(statusCode).c_str());
   }
 
+  //Serial.println(requestBody);
+ 
+  /*const char* requestChar = requestBody.c_str();
+
+  if (client.publish("shirasuCorp/agriIoT/EC5", requestChar) == true) {
+  Serial.println("Success sending message");
+  } else {
+  Serial.println("Error sending message");
+  }
+ 
+  client.loop();*/
+
   Serial.println("MAC:");
   Serial.println(baseMacChr);
   Serial.println("EC5Vol:");
   Serial.println(EC5Voltage);
+ 
+  
 }
+  
 
 // 使うか不明　デバッグ用？　追加
 void callback(char* topic, byte* message, unsigned int length) {
@@ -502,7 +555,7 @@ void callback(char* topic, byte* message, unsigned int length) {
 }
 
 //   再接続のための関数　追加
-void reconnect(){
+void MQTT_reconnect(){
   // Loop until we're reconnected
   while (!client.connected()) {   //非接続の間繰り返す
     Serial.print("Attempting MQTT connection...");    //「Attempting MQTT connection..."」と表示
