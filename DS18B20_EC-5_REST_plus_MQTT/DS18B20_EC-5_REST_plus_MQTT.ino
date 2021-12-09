@@ -1,10 +1,9 @@
-
 //210416 Firebeetole+DS180B20+deepsleep(Wifi off) for Isahaya
 
 // Grab a count of devices on the wire
 //  numberOfDevices = sensors.getDeviceCount();
 // getDeviceCount()がうまく利用できないためにとりあえず整数値を与える
-//210324 BOOTCOUNT_const中は，5分に一回起動，その後時刻00分と30分に起動
+//210324 BOOTCOUNT_CONST中は，5分に一回起動，その後時刻00分と30分に起動
 
 // 関数のプロトタイプ宣言と何に使う関数なのか明記したい(21/07/30)
 
@@ -14,7 +13,7 @@
  https://lang-ship.com/blog/work/arduino-for-visual-studio-code/
  を参照
 */
-uint8_t numberOfDevices = 4;
+uint8_t numberOfDevices = 8;
 
 #include <esp_wifi.h>
 #include <esp_sleep.h>
@@ -30,9 +29,16 @@ uint8_t numberOfDevices = 4;
 #include "soc/i2s_reg.h"
 #include "soc/sens_reg.h"
 #include "soc/syscon_reg.h"
+#include <PubSubClient.h>  //MQTT通信のために必要
 
-const char MY_SSID[] = "PIX-MT100";
-const char MY_PASSWORD[] = "mistmist";
+const char MY_SSID[] = "PIX-MT100"; //E213
+const char MY_PASSWORD[] = "mistmist";  //213wl213wl
+const char* MQTT_Server = "133.45.129.18"; //MQTTのIPアドレスまたはホスト名　追加  133.45.129.190  mms.mist-hospital.mydns.jp
+const uint16_t MQTT_Port = 11883; //MQTTブローカのポート番号(TCP接続)
+
+WiFiClient espClient;           //client.connect()で定義されている指定のインターネットIPアドレスおよびポートに接続できるクライアントを作成?
+PubSubClient client(espClient);     //MQTTの通信を行うためのPubsubClientのクラスから実際に処理を行うオブジェクトclientを作成?
+
 uint8_t baseMac[6];
 
 /*********
@@ -44,37 +50,38 @@ uint8_t baseMac[6];
 #include <DallasTemperature.h>
 
 #define uS_TO_S_FACTOR 1000000 /* Conversion factor for micro seconds to seconds */
-#define TIME_TO_SLEEP 5        /* Time ESP32 will go to sleep (in seconds) */
 
 // Data wire is plugged TO GPIO 4
 #define ONE_WIRE_BUS 4
 
 //Field ID
-#define FIELDID 1005 // 諫早試験場フィールド"Isahaya1"のフィールド番号
+#define FIELDID 1007 // テストサーバー"test2"のフィールド番号
 
 //Initial Condition Test Term 5 min wake 210324
-#define BOOTCOUNT_const 5
+#define BOOTCOUNT_CONST 80
 
-// FET Gate signal pin
-#define GRM_GATE 25
-#define DS18B20_GATE 26
+//FET Gate signal pin
+#define OPEN_DRAIN_PIN 2
+#define PSVOL_GATE 5
 
-// post_ADCresult()関数で使うADCピンの範囲
-#define FIRST_CH_OF_ADC 1
-#define LAST_CH_OF_ADC 3
+//EC-5
+#define NUM_OF_SAMP 64 //number of samples
 
 // Function Prototype Declarations
-void DS();
+void esp_startup();                             // esp32のDeep Sleepやらデバッグのためのシリアルポートやらのための立ち上げ設定
+void wifi_startup();                            // wi-fi機能を立ち上げる
+void DS18B20_startup();                         // DS18B20の立ち上げ
+void DS();                                      // Deep Sleep
 void activate_sensors();                        // FETのゲートをHIGHにし、センサーを起動
 void stop_sensors();                            // FETのゲートをLOWにし、センサーを停止
 void post_DS18B20data();                        // 電池電圧をAD変換してサーバーに送信
 void printAddress(DeviceAddress deviceAddress); // 64bitのアドレスを16進数表示にする
 void time_adj();                                // よくわからんから放置。多分なくてもいい。
-void sendLineNotify(float tempC);               // Line通知する関数っぽい
 void post_PSVolServer();                        // Power Supply Voltageをサーバーに送信
 void post_wifilevel();                          // ESP32のRSSIをサーバーに送信
-void post_GRMresult();                          // 接地抵抗の測定値をサーバーに送信
-void post_ADCresult();                          // AD変換結果をサーバーに送信
+void post_EC5data();                            // EC-5のアナログ電圧をサーバーに送信
+void callback(char* topic, byte* message, unsigned int length);                                // 使うか不明　デバッグ用？　追加
+void MQTT_reconnect();                               // 再接続のための関数
 
 RTC_DATA_ATTR int bootCount = 0;
 
@@ -87,39 +94,74 @@ DallasTemperature sensors(&oneWire);
 // We'll use this variable to store a found device address
 DeviceAddress tempDeviceAddress;
 
+uint16_t boot_time_span = 5;
 uint16_t time_span = 30;
 
 //ADC chnnel
-const int adcPin[5] = {36, 39, 34, 35, 15};
+const int adcPin[4] = {36, 39, 34, 35};
 
-const int R1 = 10000;
-const int R2 = 10000;
+const int R1 = 27000;
+const int R2 = 27000;
+
+//EC-5
+uint16_t one_shot_voltage[NUM_OF_SAMP];
 
 void setup()
 {
-  // put your setup code here, to run once:
+  esp_startup(); 
+  delay(100);
+
+  wifi_startup();
+
+  client.setServer(MQTT_Server, MQTT_Port);    //インスタンス化(実体化)したオブジェクトclientの接続先のサーバを、アドレスとポート番号を設定して通信できるようにする　追加
+  client.setCallback(callback);   //callback関数の設定　追加
+
+  if (!client.connected()) {  //接続できていない場合
+    MQTT_reconnect();    //関数(再接続)
+  }
+  client.loop();
+
+  esp_read_mac(baseMac, ESP_MAC_WIFI_STA);
+  activate_sensors();
+  delay(1000);
+
+  configTime(0, 0, "ntp.nict.jp", "time.google.com", "ntp.jst.mfeed.ad.jp");
+  DS18B20_startup();
+  post_DS18B20data();
+  post_PSVolServer(); // Power Supply Voltage Monitoring
+  post_wifilevel();
+  post_EC5data();
+  esp_wifi_stop();
+  WiFi.mode(WIFI_OFF);
+  stop_sensors();
+  DS();
+}
+
+void loop()
+{
+}
+
+void esp_startup()
+{
   Serial.begin(115200, SERIAL_8N1); //ビットレート115200 8bit/パリティなし/1ストップビット
-  while (!Serial)
-    ; // シリアル通信ができるまで待機　
-  int countw = 0;
+  while (!Serial); // シリアル通信ができるまで待機
   Serial.print("Time Span =");
   Serial.println(time_span);
-  if (bootCount <= BOOTCOUNT_const)
+  if (bootCount <= BOOTCOUNT_CONST)
     bootCount++;
   Serial.println("Start");
   Serial.println("Boot Count:" + String(bootCount));
 
   esp_deep_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_OFF);
   esp_deep_sleep_pd_config(ESP_PD_DOMAIN_RTC_SLOW_MEM, ESP_PD_OPTION_ON);
-  //  esp_deep_sleep_pd_config(ESP_PD_DOMAIN_RTC_SLOW_MEM, ESP_PD_OPTION_OFF);
   esp_deep_sleep_pd_config(ESP_PD_DOMAIN_RTC_FAST_MEM, ESP_PD_OPTION_ON);
-  //  esp_deep_sleep_pd_config(ESP_PD_DOMAIN_RTC_FAST_MEM, ESP_PD_OPTION_OFF);
-  //  esp_deep_sleep_pd_config(ESP_PD_DOMAIN_MAX, ESP_PD_OPTION_OFF);
 
-  // put your main code here, to run repeatedly:
-  delay(100);
+}
 
-  // while (!Serial);                    //  ここ以前でもシリアル使ってるのになんで待機？？　多分いらないので削除予定
+void wifi_startup()
+{
+  int countw = 0;
+  
   WiFi.mode(WIFI_AP_STA);
   WiFi.begin(MY_SSID, MY_PASSWORD);
   Serial.print("WiFi connecting");
@@ -138,93 +180,68 @@ void setup()
     countw = countw + 1;
   }
 
-  esp_read_mac(baseMac, ESP_MAC_WIFI_STA);
-  activate_sensors();
   Serial.println(" connected");
-  delay(1000);
-  configTime(0, 0, "ntp.nict.jp", "time.google.com", "ntp.jst.mfeed.ad.jp");
+}
 
+void DS18B20_startup()
+{
   // Start up the library
   sensors.begin();
   // Loop through each device, print out address
-  for (int i = 0; i < numberOfDevices; i++)
-  {
+  for (int i = 0; i < numberOfDevices; i++){
     // Search the wire for address
-    if (sensors.getAddress(tempDeviceAddress, i))
-    {
+    if (sensors.getAddress(tempDeviceAddress, i)){
       Serial.print("Found device ");
       Serial.print(i, DEC);
       Serial.print(" with address: ");
       printAddress(tempDeviceAddress);
       Serial.println();
     }
-
-    else
-    {
+    else{
       Serial.print("Found number of total devices are ");
       numberOfDevices = i;
       Serial.println(i, DEC);
     }
   }
-
-  post_DS18B20data();
-  // postPSVolServer(); // Power Supply Voltage Monitoring
-  post_wifilevel();
-  post_GRMresult();
-  // time_adj();
-  esp_wifi_stop();
-  WiFi.mode(WIFI_OFF);
-  DS();
-}
-
-void loop()
-{
 }
 
 void DS()
 {
   int set_sleep_sec;
-  //  if(time_span ==0)time_span = 30;                        //なんでここ？　time_spanはdefineにする予定
-  //  if (bootCount <= BOOTCOUNT_const) set_sleep_sec = 5 * 60; //sec 起動回数が80回未満のとき、待機時間は５分
-  //  else   set_sleep_sec = time_span * 60;   // sec  起動回数が80回を超えたとき、待機時間(set_sleep_sec)を30分にする
 
-  if (bootCount <= BOOTCOUNT_const)
-  {
-    set_sleep_sec = 5 * 60;
+  if (bootCount <= BOOTCOUNT_CONST){
+    set_sleep_sec = boot_time_span * 60;
   }
-
-  else
-  {
+  else{
     set_sleep_sec = time_span * 60;
   }
 
-  stop_sensors();
   Serial.println("Sleep!");
   Serial.print("The next boot will be in ");
   Serial.print(set_sleep_sec / 60, DEC);
   Serial.println(" minutes.");
 
-  SET_PERI_REG_BITS(RTC_CNTL_TEST_MUX_REG, RTC_CNTL_DTEST_RTC, 0, RTC_CNTL_DTEST_RTC_S); //削除予定
-  CLEAR_PERI_REG_MASK(RTC_CNTL_TEST_MUX_REG, RTC_CNTL_ENT_RTC);                          //削除予定
-  CLEAR_PERI_REG_MASK(RTC_CNTL_CLK_CONF_REG, RTC_CNTL_CK8M_FORCE_PU);                    //削除予定
-  esp_deep_sleep_enable_timer_wakeup(set_sleep_sec * 1000 * 1000);                       // wakeup(restart) after set_sleep_sec
+  SET_PERI_REG_BITS(RTC_CNTL_TEST_MUX_REG, RTC_CNTL_DTEST_RTC, 0, RTC_CNTL_DTEST_RTC_S); 
+  CLEAR_PERI_REG_MASK(RTC_CNTL_TEST_MUX_REG, RTC_CNTL_ENT_RTC);                          
+  CLEAR_PERI_REG_MASK(RTC_CNTL_CLK_CONF_REG, RTC_CNTL_CK8M_FORCE_PU);                    
+  esp_deep_sleep_enable_timer_wakeup(set_sleep_sec * 1000 * 1000);  // wakeup(restart) after set_sleep_sec
   esp_deep_sleep_start();
   Serial.println("zzz"); // ここは実行されない
 }
 
 void activate_sensors()
 {
-  pinMode(GRM_GATE, OUTPUT);         // 接地抵抗計のロードスイッチのN-MOSFETゲート信号として使用
-  pinMode(DS18B20_GATE, OPEN_DRAIN); // 温度センサのスイッチ回路をオープンドレインで使用
+  pinMode(OPEN_DRAIN_PIN, OUTPUT_OPEN_DRAIN); // 3V3ラインのスイッチとして使用
+  pinMode(PSVOL_GATE, OUTPUT);               // 電源電圧測定回路のスイッチとして使用
 
-  digitalWrite(GRM_GATE, HIGH);    // 接地抵抗計のロードスイッチをON
-  digitalWrite(DS18B20_GATE, LOW); // DS28B20のスイッチをオン(オープンドレインON LOW出力)
+  digitalWrite(OPEN_DRAIN_PIN, LOW); // 3V3ラインのスイッチをオン
+  digitalWrite(PSVOL_GATE, HIGH);   // 電源電圧測定回路のスイッチをオン
 }
 
 void stop_sensors()
 {
-  digitalWrite(GRM_GATE, LOW);      // 接地抵抗計のロードスイッチをON
-  digitalWrite(DS18B20_GATE, HIGH); // DS28B20のスイッチをオフ(オープンドレイン開放 ハイインピーダンス)
+  digitalWrite(OPEN_DRAIN_PIN, HIGH); // 3V3ラインのスイッチをオフ
+  digitalWrite(PSVOL_GATE, LOW);     // 電源電圧測定回路のスイッチをオフ
 }
 
 void post_DS18B20data()
@@ -244,17 +261,10 @@ void post_DS18B20data()
     if (sensors.getAddress(tempDeviceAddress, i))
     {
       // Output the device ID
-      //  if(sensors.getAddress(tempDeviceAddress, i)==0){
-      //    return;
-      //  }
-
       Serial.print(" Temperature for device: ");
       Serial.println(i, DEC);
       // Print the data
       tempC = sensors.getTempC(tempDeviceAddress);
-      //if(timeInfo.tm_hour ==0 || timeInfo.tm_hour ==9 && timeInfo.tm_min>29){
-      //  "Sending Message to LINE nitify agri-notify",
-      //  sendLineNotify(tempC);
       delay(1000);
     }
     Serial.print("Temp C: ");
@@ -265,7 +275,7 @@ void post_DS18B20data()
     // Block until we are able to connect to the WiFi access point
     HTTPClient http;
     http.begin("http://mist-hospital.mydns.jp/kabayaki/db/DS18B20");
-    http.addHeader("Content-Type", "application/json");
+    http.addHeader("Content-Type", "application/json"); 
 
     StaticJsonDocument<200> doc;
     // Add values in the document
@@ -279,25 +289,30 @@ void post_DS18B20data()
 
     String requestBody;
     serializeJson(doc, requestBody);
-
+ 
     int httpResponseCode = http.POST(requestBody);
 
-    if (httpResponseCode > 0)
-    {
+    if (httpResponseCode > 0)    {
       String response = http.getString();
       Serial.println(httpResponseCode);
       Serial.println(response);
+    }else{
+      //Serial.printf("Error occurred while sending HTTP POST: %s\n", HTTPClient.errorToString(statusCode).c_str());
     }
+ 
+    //Serial.println(requestBody);
 
-    else
-    {
-      //      Serial.printf("Error occurred while sending HTTP POST: %s\n", HTTPClient.errorToString(statusCode).c_str());
+    const char* requestChar = requestBody.c_str(); //MQTTでpublishするためにはJSONドキュメントをstring型からconst char*型にする必要があるため
+
+    if (client.publish("shirasuCorp/demo/DS18B20", requestChar) == true) {
+    Serial.println("Success sending message");
+    } else {
+    Serial.println("Error sending message");
     }
-
+    client.loop();
     delay(100);
+    
   }
-
-  digitalWrite(DS18B20_GATE, HIGH);
 }
 
 // function to print a device address
@@ -311,70 +326,20 @@ void printAddress(DeviceAddress deviceAddress)
   }
 }
 
-//function to time adjustment and LINE notify
-void time_adj()
-{
-  struct tm timeInfo;
-  getLocalTime(&timeInfo);
-  if (timeInfo.tm_hour = 11 && timeInfo.tm_min > 29)
-  {
-    if (timeInfo.tm_min <= 30)
-    {
-      //      time_span = 30 - timeInfo.tm_min;
-      time_span = 30;
-      //    }else time_span = 30;
-    }
-    else
-      time_span = 30;
-  }
-}
-
-//Line通知
-void sendLineNotify(float tempC)
-{
-  const char *host = "notify-api.line.me";
-  const char *token = "62A3Yxophwryuu954UCYhYMba35N8RD2W7dwK9pbbZr";
-  const char *message_headder = "現在の";
-  const char *message_headder2 = "の地温は，";
-  const char *message = "°Cです。";
-  WiFiClientSecure client;
-  Serial.println("Try");
-  //LineのAPIサーバに接続
-  if (!client.connect(host, 443))
-  {
-    Serial.println("Connection failed");
-    return;
-  }
-  Serial.println("Connected");
-  //リクエストを送信
-  String query = String("message=") + String(message_headder) + String(message_headder2) + String(tempC) + String(message);
-  String request = String("") +
-                   "POST /api/notify HTTP/1.1\r\n" +
-                   "Host: " + host + "\r\n" +
-                   "Authorization: Bearer " + token + "\r\n" +
-                   "Content-Length: " + String(query.length()) + "\r\n" +
-                   "Content-Type: application/x-www-form-urlencoded\r\n\r\n" +
-                   query + "\r\n";
-  client.print(request);
-
-  //受信終了まで待つ
-  while (client.connected())
-  {
-    String line = client.readStringUntil('\n');
-    if (line == "\r")
-    {
-      break;
-    }
-  }
-
-  String line = client.readStringUntil('\n');
-  Serial.println(line);
-}
 
 void post_PSVolServer()
 {
-  float value = analogRead(adcPin[0]);                   //電池電圧を計ってるっぽい
-  float voltage = value * (R1 + R2) / R2 * (3.6 / 4095); //電池電圧を分圧してる計算っぽい
+  uint32_t sum = 0;
+  for (int i = 0; i < NUM_OF_SAMP; i++)
+  {
+    one_shot_voltage[i] = analogReadMilliVolts(adcPin[0]);
+  }
+  for (int i = 0; i < NUM_OF_SAMP; i++)
+  {
+    sum += one_shot_voltage[i];
+  }
+  float voltage = sum / NUM_OF_SAMP * (R1 + R2) / R2 / 1000.0; //電池電圧を分圧してる計算っぽい
+
   char baseMacChr[18] = {0};
   sprintf(baseMacChr, "%02X:%02X:%02X:%02X:%02X:%02X", baseMac[0], baseMac[1], baseMac[2], baseMac[3], baseMac[4], baseMac[5]);
 
@@ -399,32 +364,39 @@ void post_PSVolServer()
 
   String requestBody;
   serializeJson(doc, requestBody);
+  
+  //Serial.println(requestBody);
+ 
+  /*const char* requestChar = requestBody.c_str();
 
+    if (client.publish("shirasuCorp/demo/PSVol", JSONmessageBuffer) == true) {
+    Serial.println("Success sending message");
+  } else {
+    Serial.println("Error sending message");
+  }
+ 
+  client.loop();*/
+  
   int httpResponseCode = http.POST(requestBody);
 
-  if (httpResponseCode > 0)
-  {
+  if (httpResponseCode > 0)  {
     String response = http.getString();
     Serial.println(httpResponseCode);
     Serial.println(response);
-  }
-  else
-  {
+  }  else  {
     //      Serial.printf("Error occurred while sending HTTP POST: %s\n", HTTPClient.errorToString(statusCode).c_str());
   }
 
   Serial.println("MAC:");
   Serial.println(baseMacChr);
-  Serial.println("ADC:");
+  Serial.println("PSVol:");
   Serial.println(voltage);
+  
 }
+  
 
 void post_wifilevel()
-{ // int型になってたのでvoid方に直した
-  if (WiFi.status() != WL_CONNECTED)
-  {
-    return;
-  }
+{
   long rssi = WiFi.RSSI();
   char baseMacChr[18] = {0};
   sprintf(baseMacChr, "%02X:%02X:%02X:%02X:%02X:%02X", baseMac[0], baseMac[1], baseMac[2], baseMac[3], baseMac[4], baseMac[5]);
@@ -453,60 +425,53 @@ void post_wifilevel()
 
   int httpResponseCode = http.POST(requestBody);
 
-  if (httpResponseCode > 0)
-  {
+  if (httpResponseCode > 0)  {
     String response = http.getString();
     Serial.println(httpResponseCode);
     Serial.println(response);
-  }
-  else
-  {
+  }  else  {
     //      Serial.printf("Error occurred while sending HTTP POST: %s\n", HTTPClient.errorToString(statusCode).c_str());
   }
+
+  //Serial.println(requestBody);
+ 
+  /*const char* requestChar = requestBody.c_str();
+
+  if (client.publish("shirasuCorp/demo/wifilevel", requestChar) == true) {
+  Serial.println("Success sending message");
+  } else {
+  Serial.println("Error sending message");
+  }
+ 
+  client.loop();*/
 
   Serial.println("MAC:");
   Serial.println(baseMacChr);
   Serial.println("RSSi:");
   Serial.println(rssi);
+ 
 }
 
-void post_GRMresult()
+
+void post_EC5data()
 {
-  if (WiFi.status() != WL_CONNECTED)
+  uint32_t sum = 0;
+  for (int i = 0; i < NUM_OF_SAMP; i++)
   {
-    return;
+    one_shot_voltage[i] = analogReadMilliVolts(adcPin[1]);
   }
-
-  Serial2.begin(9600); // add PIC16F1765との通信レート
-  while (!Serial2)
-    ;
-
-  float GroundResistance = 0.0;
-  uint32_t buf[4];
-
-  while (3 >> Serial2.available())
-    ;                      // バッファにデータが4つ蓄積されるまで待機
-  buf[0] = Serial2.read(); // 最下位レジスタ
-  buf[1] = Serial2.read(); // 中位レジスタ
-  buf[2] = Serial2.read(); // 最上位レジスタ
-  buf[3] = Serial2.read(); // サンプル数
-
-  Serial2.end();
-  digitalWrite(GRM_GATE, LOW); // ロードスイッチを一旦オフ
-
-  buf[2] = (buf[2] * 65536) + (buf[1] * 256) + buf[0];
-  GroundResistance = (float)buf[2] / (float)buf[3] * 0.612 - 0.4664;
-  Serial.print("number of sumples = ");
-  Serial.println(buf[3]);
-  Serial.print("Rg = ");
-  Serial.println(GroundResistance, 2);
+  for (int i = 0; i < NUM_OF_SAMP; i++)
+  {
+    sum += one_shot_voltage[i];
+  }
+  float EC5Voltage = sum / NUM_OF_SAMP / 1000.0;
 
   char baseMacChr[18] = {0};
   sprintf(baseMacChr, "%02X:%02X:%02X:%02X:%02X:%02X", baseMac[0], baseMac[1], baseMac[2], baseMac[3], baseMac[4], baseMac[5]);
 
   // Block until we are able to connect to the WiFi access point
   HTTPClient http;
-  http.begin("http://mist-hospital.mydns.jp/kabayaki/db/gr");
+  http.begin("http://mist-hospital.mydns.jp/kabayaki/db/ec5");
   http.addHeader("Content-Type", "application/json");
   struct tm timeInfo;
   char detecting_time[20];
@@ -516,9 +481,8 @@ void post_GRMresult()
 
   StaticJsonDocument<200> doc;
   // Add values in the document
-  //
   doc["addr"] = baseMacChr;
-  doc["gr"] = GroundResistance;
+  doc["ec5"] = EC5Voltage;
   doc["field"] = FIELDID;
   sprintf(detecting_time, "%04d-%02d-%02dT%02d:%02d:%02d", timeInfo.tm_year + 1900, timeInfo.tm_mon + 1, timeInfo.tm_mday, timeInfo.tm_hour, timeInfo.tm_min, timeInfo.tm_sec);
   doc["detect"] = detecting_time;
@@ -539,57 +503,73 @@ void post_GRMresult()
     //      Serial.printf("Error occurred while sending HTTP POST: %s\n", HTTPClient.errorToString(statusCode).c_str());
   }
 
+  //Serial.println(requestBody);
+ 
+  /*const char* requestChar = requestBody.c_str();
+
+  if (client.publish("shirasuCorp/agriIoT/EC5", requestChar) == true) {
+  Serial.println("Success sending message");
+  } else {
+  Serial.println("Error sending message");
+  }
+ 
+  client.loop();*/
+
   Serial.println("MAC:");
   Serial.println(baseMacChr);
+  Serial.println("EC5Vol:");
+  Serial.println(EC5Voltage);
+ 
+  
+}
+  
+
+// 使うか不明　デバッグ用？　追加
+void callback(char* topic, byte* message, unsigned int length) {
+  Serial.print("Message arrived on topic: ");   //「Message arrived on topic:」と表示
+  Serial.print(topic);      //データの識別コードを表示
+  Serial.print(". Message: ");    //「. Message: 」と表示
+  String messageTemp;   //文字列？
+  
+  for (int i = 0; i < length; i++) {  //メッセージ長だけ繰り返す
+    Serial.print((char)message[i]);
+    messageTemp += (char)message[i];
+  }
+  Serial.println();
+
+  // Feel free to add more if statements to control more GPIOs with MQTT
+
+  // If a message is received on the topic esp32/output, you check if the message is either "on" or "off". 
+  // Changes the output state according to the message
+  if (String(topic) == "esp32/output") {  //String()：Stringクラス(文字列)のインスタンスを生成？
+    Serial.print("Changing output to ");
+    if(messageTemp == "on"){
+      Serial.println("on");
+      
+    }
+    else if(messageTemp == "off"){
+      Serial.println("off");
+      
+    }
+  }
 }
 
-void post_ADCresult()
-{
-  for (uint8_t i = FIRST_CH_OF_ADC; i < LAST_CH_OF_ADC; i++)
-  {
-    float adc_result;
-    adc_result = 3.3 * (float)analogRead(adcPin[i]) / 4096.0;
-
-    char baseMacChr[18] = {0};
-    sprintf(baseMacChr, "%02X:%02X:%02X:%02X:%02X:%02X", baseMac[0], baseMac[1], baseMac[2], baseMac[3], baseMac[4], baseMac[5]);
-
-    // Block until we are able to connect to the WiFi access point
-    HTTPClient http;
-    http.begin("http://mist-hospital.mydns.jp/kabayaki/db/voltage");
-    http.addHeader("Content-Type", "application/json");
-    struct tm timeInfo;
-    char detecting_time[20];
-    char address_str[16];
-    getLocalTime(&timeInfo);
-    delay(10);
-
-    StaticJsonDocument<200> doc;
-    // Add values in the document
-    doc["addr"] = baseMacChr;
-    doc["voltage"] = adc_result;
-    doc["field"] = FIELDID;
-    sprintf(detecting_time, "%04d-%02d-%02dT%02d:%02d:%02d", timeInfo.tm_year + 1900, timeInfo.tm_mon + 1, timeInfo.tm_mday, timeInfo.tm_hour, timeInfo.tm_min, timeInfo.tm_sec);
-    doc["detect"] = detecting_time;
-
-    String requestBody;
-    serializeJson(doc, requestBody);
-
-    int httpResponseCode = http.POST(requestBody);
-
-    if (httpResponseCode > 0)
-    {
-      String response = http.getString();
-      Serial.println(httpResponseCode);
-      Serial.println(response);
+//   再接続のための関数　追加
+void MQTT_reconnect(){
+  // Loop until we're reconnected
+  while (!client.connected()) {   //非接続の間繰り返す
+    Serial.print("Attempting MQTT connection...");    //「Attempting MQTT connection..."」と表示
+    // Attempt to connect
+    if (client.connect("ESP8266Client")) {    //接続できた場合
+      Serial.println("connected");
+      // Subscribe
+      client.subscribe("esp32/output");
+    } else {                                  //接続に失敗した場合
+      Serial.print("failed, rc=");
+      Serial.print(client.state());
+      Serial.println(" try again in 5 seconds");
+      // Wait 5 seconds before retrying
+      delay(5000);    //5秒待機
     }
-    else
-    {
-      //      Serial.printf("Error occurred while sending HTTP POST: %s\n", HTTPClient.errorToString(statusCode).c_str());
-    }
-
-    Serial.println("MAC:");
-    Serial.println(baseMacChr);
-    Serial.println("ADC:");
-    Serial.println(adc_result);
   }
 }
