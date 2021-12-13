@@ -3,8 +3,8 @@
 #include <PubSubClient.h>   //MQTT通信のために必要
 #include <Wire.h>
 
-#define RAIN_GAUGE_PIN 7
-#define POLLING_INTERVAL 1      //POLLING_INTERVAL=1が一番うまく動作した
+#define RAIN_GAUGE_PIN 25
+#define POLLING_INTERVAL 1     //POLLING_INTERVAL=1が一番うまく動作した
 
 unsigned long recent_time;
 unsigned long prev_time = 0; 
@@ -28,19 +28,21 @@ void record_file_per_hour();  //関数：1時間当たりの雨量計が反応�
 void send_json_rain();        //関数：jsonに変換&送信する
 
 void reconnect();             //関数：再接続
-void callback(char* topic, byte* message, unsigned int length)
+void callback(char* topic, byte* message, unsigned int length);
+void wifi_startup();
 
 void setup() {
   Serial.begin(115200, SERIAL_8N1); //ビットレート115200 8bit/パリティなし/1ストップビット
   pinMode(RAIN_GAUGE_PIN,INPUT);    //7番ピンを入力に設定
 
+  setup_wifi();   //関数(WiFi接続)
   client.setServer(mqtt_server, 11883);    //インスタンス化(実体化)したオブジェクトclientの接続先のサーバを、アドレスとポート番号を設定して通信できるようにする　追加
   client.setCallback(callback);   //callback関数の設定　追加
 
   if (!client.connected()) {  //接続できていない場合
     reconnect();    //関数(再接続)
   }
-  client.loop();
+  client.loop();    //通信できているかの確認
 
   }
 
@@ -54,6 +56,7 @@ void loop() {
   
   digitalRead(RAIN_GAUGE_PIN);    //7番ピンの状態を取得
   pulse_polling();  //関数：雨量計が反応した際にカウントを進める
+  //Serial.println(prev_status,DEC);
   delay(POLLING_INTERVAL);  //0.001秒待機
   
   
@@ -94,20 +97,22 @@ void record_file_per_hour(){    //関数：1時間当たりの雨量計が反応
 void send_json_rain(){    //関数：jsonに変換&送信する
   // JSON用の固定バッファを確保。
     //この例では300文字分。
-    StaticJsonBuffer<300> JSONbuffer;
-    // Add values in the document
-    JsonObject& JSONencoder = JSONbuffer. createObject();  //作成したStaticJsonDocumentオブジェクトからJsonObjectへの参照を取得
-    JSONencoder["rain_gauge_per_hour"] = Rcount;
+    StaticJsonDocument<200> doc;
+   
+    doc["rain_gauge_per_hour"] = Rcount;
 
-    char JSONmessageBuffer[100];
-    JSONencoder.printTo(JSONmessageBuffer, sizeof(JSONmessageBuffer));
-    Serial.println(JSONmessageBuffer);
+    String requestBody;
+    serializeJson(doc, requestBody);
+
+     const char* requestChar = requestBody.c_str(); //MQTTでpublishするためにはJSONドキュメントをstring型からconst char*型にする必要があるため
     
-    if (client.publish("agriIoT/rain_gauge", JSONmessageBuffer) == true) {
+    if (client.publish("agriIoT/rain_gauge",requestChar) == true) {
       Serial.println("Success sending message");
     } else {
       Serial.println("Error sending message");
     }
+    client.loop();
+    delay(100);
     
 }
 
@@ -162,3 +167,23 @@ void callback(char* topic, byte* message, unsigned int length) {
   }
 }
 
+//setupで使用する関数
+void setup_wifi() {   //WiFiに接続するための関数
+  delay(10);      //0.01秒待機
+  // We start by connecting to a WiFi network
+  Serial.println();
+  Serial.print("Connecting to ");
+  Serial.println(MY_SSID);
+
+  WiFi.begin(MY_SSID, MY_PASSWORD);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println("");
+  Serial.println("WiFi connected");
+  Serial.println("IP address: ");
+  Serial.println(WiFi.localIP());   //WiFIシールドのIPアドレスを入手する    
+}
