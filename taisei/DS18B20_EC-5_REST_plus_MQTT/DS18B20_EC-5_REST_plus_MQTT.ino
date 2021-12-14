@@ -265,7 +265,7 @@ void post_DS18B20data()
       Serial.println(i, DEC);
       // Print the data
       tempC = sensors.getTempC(tempDeviceAddress);
-      delay(1000);
+      delay(100);
     }
     Serial.print("Temp C: ");
     Serial.print(tempC, DEC);
